@@ -60,7 +60,8 @@ def preprocess_crop(crop: np.ndarray) -> np.ndarray:
       3. CLAHE      — contrast enhancement on the L channel (LAB)
       4. Sharpen    — unsharp mask to make character edges crisp for DBNet
       5. Invert     — flip dark-on-light plates so text is always dark-on-white
-      6. Border     — add white padding so DBNet doesn't miss edge characters
+      6. Otsu       — binarise to clean black-on-white (helps TrOCR ViT encoder)
+      7. Border     — add white padding so DBNet doesn't miss edge characters
 
     Returns a BGR image ready for PaddleOCR.
     """
@@ -102,7 +103,17 @@ def preprocess_crop(crop: np.ndarray) -> np.ndarray:
     if center_strip.mean() < gray.mean() - 15:
         img = cv2.bitwise_not(img)
 
-    # 6. Border padding ───────────────────────────────────────────────────────
+    # 6. Otsu binarisation ────────────────────────────────────────────────────
+    # At this point the plate is always dark-text-on-light (step 5 ensured it).
+    # Gaussian blur first smooths the bimodal histogram so Otsu picks a clean
+    # threshold; the result is crisp black characters on a white field which
+    # helps TrOCR's ViT encoder and removes remaining colour/texture noise.
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    img = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+    # 7. Border padding ───────────────────────────────────────────────────────
     # A 10 px white border stops DBNet from clipping characters at the edge.
     img = cv2.copyMakeBorder(img, 10, 10, 10, 10,
                              cv2.BORDER_CONSTANT, value=(255, 255, 255))

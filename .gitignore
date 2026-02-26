@@ -26,6 +26,9 @@ __pycache__/
 debug_plate*.jpg
 debug_plate*.png
 
+# VS Code workspace settings
+.vscode/
+
 # OS
 .DS_Store
 Thumbs.db

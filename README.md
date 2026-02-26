@@ -5,19 +5,21 @@ A multi-engine OCR pipeline for reading US license plates from images or a live 
 ## Pipeline Overview
 
 ```
-Image → YOLO detection → Crop + Preprocess → PaddleOCR (pass A + B)
-                                           → TrOCR (cross-check)
-                                           → Qwen2-VL LLM (tiebreak on mismatch)
+Image → YOLO detection → Crop + Preprocess → PaddleOCR  ─┐
+                                           → CRNN+CTC    ─┼─ 2-of-3 majority vote
+                                           → TrOCR       ─┘
+                                           → Qwen2-VL LLM (tiebreak on 3-way split)
                                            → Zone-corrected text output
 ```
 
 1. **YOLO** detects the plate bounding box
-2. **Preprocessor** crops, denoises, enhances contrast, sharpens, and pads the crop
-3. **PaddleOCR** runs two passes (preprocessed + plain resize)
-4. **TrOCR** runs in parallel as a second opinion
-5. If PaddleOCR and TrOCR agree → return that result (boosted confidence)
-6. If they disagree → **Qwen2-VL LLM** (via Ollama) makes the final call
-7. Zone correction fixes common OCR confusions (e.g. `0`↔`O`, `1`↔`I`, `8`↔`B`)
+2. **Preprocessor** crops, denoises (median blur), enhances contrast (CLAHE), sharpens, inverts dark plates, Otsu-binarises, and pads
+3. **PaddleOCR** reads the preprocessed crop (two passes: preprocessed + plain resize)
+4. **CRNN+CTC** reads the same crop as a fast cross-check engine (custom-trained on Lakh dataset)
+5. **TrOCR** provides a third opinion via ViT encoder (optional, slower)
+6. **2-of-3 majority vote** — if any two engines agree, that result wins
+7. If all three disagree → **Qwen2-VL LLM** (via Ollama) makes the final call
+8. **Zone correction** fixes common OCR confusions (e.g. `0`↔`O`, `1`↔`I`, `8`↔`B`)
 
 ---
 
@@ -75,7 +77,7 @@ Lower the YOLO confidence threshold (default `0.5`). Useful if plates are being 
 python detect_plate.py --image car.jpg --weights custom_yolo.pt
 ```
 
-Use a different set of YOLO weights. Defaults to `yolo_plates.pt`; falls back to `yolov8n.pt` if not found.
+Use a different set of YOLO weights. Defaults to `yolo_plates.pt`.
 
 ### OCR engine flags
 
@@ -83,7 +85,7 @@ Use a different set of YOLO weights. Defaults to `yolo_plates.pt`; falls back to
 python detect_plate.py --image car.jpg --no-trocr
 ```
 
-Disable TrOCR. Faster, but loses the cross-check — the LLM will never fire without a mismatch to resolve.
+Disable TrOCR. Faster; voting falls back to PaddleOCR + CRNN 2-of-2.
 
 ```bash
 python detect_plate.py --image car.jpg --trocr-model microsoft/trocr-large-printed
@@ -91,13 +93,25 @@ python detect_plate.py --image car.jpg --trocr-model microsoft/trocr-large-print
 
 Use a different HuggingFace TrOCR model (default: `microsoft/trocr-base-printed`). The `large` variant is more accurate but slower.
 
+```bash
+python detect_plate.py --image car.jpg --no-crnn
+```
+
+Disable the CRNN cross-check engine.
+
+```bash
+python detect_plate.py --image car.jpg --crnn-model path/to/crnn_plates.pt
+```
+
+Use a custom CRNN checkpoint (default: `crnn_plates.pt`).
+
 ### LLM flags
 
 ```bash
 python detect_plate.py --image car.jpg --no-llm
 ```
 
-Disable the Qwen2-VL LLM entirely. If TrOCR and PaddleOCR disagree, the pipeline falls back to TrOCR at 0.75 confidence.
+Disable the Qwen2-VL LLM entirely. If all engines disagree, the highest-confidence result wins.
 
 ```bash
 python detect_plate.py --image car.jpg --llm-model qwen2.5vl:7b
@@ -109,7 +123,7 @@ Use a different Ollama vision model (default: `qwen2.5vl:3b`). Larger models are
 python detect_plate.py --image car.jpg --llm-threshold 0.75
 ```
 
-When TrOCR is disabled, the LLM fires if PaddleOCR confidence drops below this threshold (default: `0.85`). Has no effect when TrOCR is active (LLM only fires on mismatch then).
+LLM fires when PaddleOCR confidence drops below this threshold (default: `0.85`).
 
 ---
 
@@ -168,16 +182,28 @@ python evaluate.py --no-trocr
 Skip TrOCR — roughly 2-3x faster per image, at some accuracy cost.
 
 ```bash
+python evaluate.py --trocr-only
+```
+
+Skip PaddleOCR and CRNN — benchmark TrOCR in isolation. YOLO still runs to find the plate crop.
+
+```bash
+python evaluate.py --no-crnn
+```
+
+Disable the CRNN cross-check engine.
+
+```bash
+python evaluate.py --crnn-model path/to/crnn_plates.pt
+```
+
+Use a custom CRNN checkpoint (default: `crnn_plates.pt`).
+
+```bash
 python evaluate.py --llm
 ```
 
 Enable the Qwen2-VL LLM tiebreaker (disabled by default in evaluate mode). Requires Ollama running with the model loaded.
-
-```bash
-python evaluate.py --llm --llm-model qwen2.5vl:7b
-```
-
-Use a larger LLM model for the tiebreaker.
 
 ```bash
 python evaluate.py --limit 100
@@ -185,11 +211,83 @@ python evaluate.py --limit 100
 
 Stop after 100 images. Useful for quick spot-checks without running the full dataset.
 
+---
+
+## confusion.py — Character-level confusion matrix
+
+Reads `eval_results.csv` and shows which characters the OCR engine commonly mistakes for others. Run this after an `evaluate.py` pass.
+
 ```bash
-python evaluate.py --conf 0.4
+python confusion.py
 ```
 
-Lower the YOLO detection threshold. May recover missed plates at the cost of some false positives.
+Lists the top 20 character confusion pairs (e.g. `O → 0`, `I → 1`, `8 → B`).
+
+```bash
+python confusion.py --top 30
+```
+
+Show more pairs.
+
+```bash
+python confusion.py --matrix
+```
+
+Also print a full character grid (rows = actual, columns = predicted).
+
+```bash
+python confusion.py --input my_results.csv
+```
+
+Use a different results CSV.
+
+---
+
+## train_crnn.py — Train the CRNN+CTC engine
+
+Trains the custom CRNN directly from the `Lakh/` folder (images are already plate crops).
+
+```bash
+python train_crnn.py --device cuda --epochs 40
+```
+
+Trains for 40 epochs on GPU. Saves the best checkpoint (by validation loss) to `crnn_plates.pt`.
+
+```bash
+python train_crnn.py --device cpu --epochs 40 --limit 5000
+```
+
+CPU training on a subset — useful for smoke-testing the pipeline.
+
+Key flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--lakh` | `Lakh` | Folder of plate crop images |
+| `--labels` | `TRAINDATA - cleaned_output.csv.csv` | Ground-truth CSV |
+| `--out` | `crnn_plates.pt` | Output checkpoint path |
+| `--epochs` | `40` | Training epochs |
+| `--batch` | `64` | Batch size |
+| `--lr` | `1e-3` | Initial learning rate |
+| `--val-split` | `0.1` | Fraction held out for validation |
+| `--device` | `cuda` | `cuda` or `cpu` |
+| `--limit` | `0` (all) | Cap number of training images |
+
+---
+
+## Preprocessing steps
+
+Each plate crop goes through these steps before OCR:
+
+| Step | Operation | Purpose |
+|------|-----------|---------|
+| 1 | Resize to 400 px wide | Normalise input scale |
+| 2 | Median blur (3×3) | Remove sensor / JPEG noise |
+| 3 | CLAHE on L channel | Boost local contrast |
+| 4 | Unsharp mask | Sharpen character edges for DBNet |
+| 5 | Dark-plate inversion | Ensure dark text on light background |
+| 6 | Otsu binarisation | Clean binary image — helps TrOCR ViT encoder |
+| 7 | 10 px white border | Prevent DBNet from clipping edge characters |
 
 ---
 
@@ -199,9 +297,12 @@ Lower the YOLO detection threshold. May recover missed plates at the cost of som
 |------|------|
 | [detect_plate.py](detect_plate.py) | CLI entry point for image / webcam |
 | [evaluate.py](evaluate.py) | Batch evaluation against ground-truth CSV |
+| [confusion.py](confusion.py) | Character confusion matrix from eval results |
+| [train_crnn.py](train_crnn.py) | Train CRNN+CTC on Lakh dataset |
+| [crnn_model.py](crnn_model.py) | CRNN architecture (CNN + BiLSTM + CTC) |
 | [detector.py](detector.py) | YOLO model loading and plate detection |
 | [preprocessor.py](preprocessor.py) | Plate cropping and image enhancement |
-| [ocr.py](ocr.py) | PaddleOCR, TrOCR, LLM OCR, zone correction |
+| [ocr.py](ocr.py) | PaddleOCR, CRNN, TrOCR, LLM OCR, zone correction |
 | [pipeline.py](pipeline.py) | Orchestrates all steps, frame annotation |
 
 ---
@@ -210,7 +311,7 @@ Lower the YOLO detection threshold. May recover missed plates at the cost of som
 
 - Python 3.10+
 - PaddlePaddle 3.x + PaddleOCR
-- Ultralytics (YOLOv8)
-- `transformers` + `torch` (for TrOCR)
+- PyTorch (for CRNN + TrOCR)
+- `transformers` (for TrOCR — `microsoft/trocr-base-printed`)
 - OpenCV (`cv2`)
 - Ollama running locally with `qwen2.5vl:3b` pulled (only needed if using LLM)
