@@ -28,8 +28,8 @@ from pathlib import Path
 import cv2
 
 from detector import load_detector, detect_plates
-from ocr import load_ocr, load_llm_ocr, load_trocr, load_crnn, run_trocr_only, read_plate_trocr_llm
-from preprocessor import crop_plate
+from ocr import load_ocr, load_llm_ocr, load_trocr, load_crnn, load_fast_ocr, run_trocr_only, run_fast_ocr_only, read_plate_trocr_llm, read_plate
+from preprocessor import crop_plate, preprocess_crop
 from pipeline import run_pipeline
 
 
@@ -122,17 +122,37 @@ def main():
                         help="Disable CRNN cross-validation")
     parser.add_argument("--crnn-model", default="crnn_plates.pt", dest="crnn_model",
                         help="Path to trained CRNN weights (default: crnn_plates.pt)")
+    parser.add_argument("--no-fast-ocr", action="store_true", dest="no_fast_ocr",
+                        help="Disable fast_plate_ocr engine")
+    parser.add_argument("--fast-ocr-model", default="cct-s-v1-global-model", dest="fast_ocr_model",
+                        help="fast_plate_ocr model name (default: cct-s-v1-global-model)")
+    parser.add_argument("--fast-ocr-only", action="store_true", dest="fast_ocr_only",
+                        help="Benchmark fast_plate_ocr in isolation — skips PaddleOCR, CRNN, TrOCR, YOLO")
     parser.add_argument("--limit",   type=int, default=0,
                         help="Stop after N images (0 = all)")
+    parser.add_argument("--skip-detection", action="store_true", dest="skip_detection",
+                        help="Skip YOLO — treat each image as a pre-cropped plate (use for Lakh/ dataset)")
+    parser.add_argument("--yolo-fallback", action="store_true", dest="yolo_fallback",
+                        help="Try YOLO first; if no detection, fall back to full image as crop (use for Lakh/ dataset)")
     args = parser.parse_args()
 
     # ── Load models ──────────────────────────────────────────────────────────
     print("Loading models...")
-    yolo  = load_detector(args.weights)
-    trocr = load_trocr(model_name=args.trocr_model) if (args.trocr_only or not args.no_trocr) else None
-    crnn  = None if (args.no_crnn or args.trocr_only) else load_crnn(model_path=args.crnn_model)
+    _solo = args.trocr_only or args.fast_ocr_only   # any solo mode skips most engines
 
-    if args.trocr_only:
+    yolo     = None if (args.skip_detection or _solo) else load_detector(args.weights)
+    trocr    = load_trocr(model_name=args.trocr_model) if (args.trocr_only or not (args.no_trocr or _solo)) else None
+    crnn     = None if (args.no_crnn  or _solo) else load_crnn(model_path=args.crnn_model)
+    fast_ocr = load_fast_ocr(model_name=args.fast_ocr_model) if (args.fast_ocr_only or not (args.no_fast_ocr or args.trocr_only)) else None
+
+    if args.fast_ocr_only:
+        if fast_ocr is None:
+            print("ERROR: fast_plate_ocr failed to load. Install it with: pip install fast-plate-ocr")
+            return
+        ocr     = None
+        llm_cfg = None
+        print(f"[Mode] fast-ocr-only ({args.fast_ocr_model}) — PaddleOCR/CRNN/TrOCR/YOLO skipped")
+    elif args.trocr_only:
         ocr     = None
         llm_cfg = load_llm_ocr(model=args.llm_model) if args.llm else None
         mode_label = "TrOCR+LLM" if llm_cfg else "TrOCR-only"
@@ -177,17 +197,41 @@ def main():
                 print(f"[{idx}/{len(labeled)}] SKIP (unreadable): {img_path.name}")
                 continue
 
-            if args.trocr_only:
+            if args.fast_ocr_only:
+                # fast_plate_ocr in isolation — image is already a plate crop
+                with contextlib.redirect_stdout(io.StringIO()):
+                    pred_text, pred_conf = run_fast_ocr_only(fast_ocr, image)
+
+            elif args.skip_detection:
+                # Lakh/ images are already plate crops — skip YOLO entirely
+                raw_crop = image
+                if args.trocr_only:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        pred_text, pred_conf = read_plate_trocr_llm(
+                            trocr, raw_crop, llm_cfg=llm_cfg, llm_threshold=llm_threshold)
+                else:
+                    preprocessed = preprocess_crop(raw_crop)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        pred_text, pred_conf = read_plate(
+                            ocr, raw_crop, preprocessed,
+                            trocr=trocr, crnn=crnn, fast_ocr=fast_ocr,
+                            llm_cfg=llm_cfg, llm_threshold=llm_threshold)
+            elif args.trocr_only:
                 # YOLO detects the plate; TrOCR reads the raw crop directly
                 with contextlib.redirect_stdout(io.StringIO()):
                     detections = detect_plates(yolo, image, conf=args.conf)
                 if detections:
-                    raw_crop  = crop_plate(image, detections[0])
-                    pred_text, pred_conf = read_plate_trocr_llm(
-                        trocr, raw_crop, llm_cfg=llm_cfg, llm_threshold=llm_threshold)
+                    raw_crop = crop_plate(image, detections[0])
+                elif args.yolo_fallback:
+                    raw_crop = image   # pre-cropped — use full image
                 else:
                     pred_text, pred_conf = "", 0.0
                     no_detection += 1
+                    raw_crop = None
+                if raw_crop is not None:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        pred_text, pred_conf = read_plate_trocr_llm(
+                            trocr, raw_crop, llm_cfg=llm_cfg, llm_threshold=llm_threshold)
             else:
                 with contextlib.redirect_stdout(io.StringIO()):
                     _, _, ocr_results = run_pipeline(
@@ -196,10 +240,19 @@ def main():
                         llm_cfg=llm_cfg,
                         trocr=trocr,
                         crnn=crnn,
+                        fast_ocr=fast_ocr,
                         llm_threshold=llm_threshold,
                     )
                 if ocr_results:
                     pred_text, pred_conf = ocr_results[0]
+                elif args.yolo_fallback:
+                    # YOLO missed it — treat full image as the crop
+                    preprocessed = preprocess_crop(image)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        pred_text, pred_conf = read_plate(
+                            ocr, image, preprocessed,
+                            trocr=trocr, crnn=crnn, fast_ocr=fast_ocr,
+                            llm_cfg=llm_cfg, llm_threshold=llm_threshold)
                 else:
                     pred_text, pred_conf = "", 0.0
                     no_detection += 1

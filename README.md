@@ -5,21 +5,23 @@ A multi-engine OCR pipeline for reading US license plates from images or a live 
 ## Pipeline Overview
 
 ```
-Image → YOLO detection → Crop + Preprocess → PaddleOCR  ─┐
-                                           → CRNN+CTC    ─┼─ 2-of-3 majority vote
-                                           → TrOCR       ─┘
-                                           → Qwen2-VL LLM (tiebreak on 3-way split)
+Image → YOLO detection → Crop + Preprocess → PaddleOCR      ─┐
+                                           → CRNN+CTC        ─┼─ any-2-of-4 agreement wins
+                                           → TrOCR           ─┤
+                                           → fast_plate_ocr  ─┘
+                                           → Qwen2-VL LLM (tiebreak when all disagree)
                                            → Zone-corrected text output
 ```
 
-1. **YOLO** detects the plate bounding box
-2. **Preprocessor** crops, denoises (median blur), enhances contrast (CLAHE), sharpens, inverts dark plates, Otsu-binarises, and pads
+1. **YOLO** (YOLOv11) detects the plate bounding box
+2. **Preprocessor** crops, denoises (median blur), enhances contrast (CLAHE), sharpens, inverts dark plates, and pads
 3. **PaddleOCR** reads the preprocessed crop (two passes: preprocessed + plain resize)
 4. **CRNN+CTC** reads the same crop as a fast cross-check engine (custom-trained on Lakh dataset)
 5. **TrOCR** provides a third opinion via ViT encoder (optional, slower)
-6. **2-of-3 majority vote** — if any two engines agree, that result wins
-7. If all three disagree → **Qwen2-VL LLM** (via Ollama) makes the final call
-8. **Zone correction** fixes common OCR confusions (e.g. `0`↔`O`, `1`↔`I`, `8`↔`B`)
+6. **fast_plate_ocr** provides a fourth ONNX-based opinion (~0.6 ms/image, optional)
+7. **Any-2-of-4 agreement** — if any two engines agree, that result wins
+8. If all engines disagree → **Qwen2-VL LLM** (via Ollama) makes the final call
+9. **Zone correction** fixes common OCR confusions (e.g. `0`↔`O`, `1`↔`I`, `8`↔`B`)
 
 ---
 
@@ -104,6 +106,18 @@ python detect_plate.py --image car.jpg --crnn-model path/to/crnn_plates.pt
 ```
 
 Use a custom CRNN checkpoint (default: `crnn_plates.pt`).
+
+```bash
+python detect_plate.py --image car.jpg --no-fast-ocr
+```
+
+Disable the fast_plate_ocr ONNX engine.
+
+```bash
+python detect_plate.py --image car.jpg --fast-ocr-model cct-s-v1-global-model
+```
+
+Use a different fast_plate_ocr model (default: `cct-s-v1-global-model`). Requires `pip install "fast-plate-ocr[onnx]"`.
 
 ### LLM flags
 
@@ -200,6 +214,30 @@ python evaluate.py --crnn-model path/to/crnn_plates.pt
 Use a custom CRNN checkpoint (default: `crnn_plates.pt`).
 
 ```bash
+python evaluate.py --no-fast-ocr
+```
+
+Disable the fast_plate_ocr ONNX engine.
+
+```bash
+python evaluate.py --fast-ocr-only --skip-detection
+```
+
+Benchmark fast_plate_ocr in isolation — skips PaddleOCR, CRNN, TrOCR, and YOLO. Use `--skip-detection` when images are already plate crops (e.g. Lakh/ dataset). Requires `pip install "fast-plate-ocr[onnx]"`.
+
+```bash
+python evaluate.py --skip-detection
+```
+
+Skip YOLO entirely — treat each image as a pre-cropped plate. Faster for datasets like Lakh/ where images are already cropped.
+
+```bash
+python evaluate.py --yolo-fallback
+```
+
+Try YOLO first; if no plate is detected, fall back to treating the full image as the crop.
+
+```bash
 python evaluate.py --llm
 ```
 
@@ -286,8 +324,7 @@ Each plate crop goes through these steps before OCR:
 | 3 | CLAHE on L channel | Boost local contrast |
 | 4 | Unsharp mask | Sharpen character edges for DBNet |
 | 5 | Dark-plate inversion | Ensure dark text on light background |
-| 6 | Otsu binarisation | Clean binary image — helps TrOCR ViT encoder |
-| 7 | 10 px white border | Prevent DBNet from clipping edge characters |
+| 6 | 10 px white border | Prevent DBNet from clipping edge characters |
 
 ---
 
@@ -302,8 +339,41 @@ Each plate crop goes through these steps before OCR:
 | [crnn_model.py](crnn_model.py) | CRNN architecture (CNN + BiLSTM + CTC) |
 | [detector.py](detector.py) | YOLO model loading and plate detection |
 | [preprocessor.py](preprocessor.py) | Plate cropping and image enhancement |
-| [ocr.py](ocr.py) | PaddleOCR, CRNN, TrOCR, LLM OCR, zone correction |
+| [ocr.py](ocr.py) | PaddleOCR, CRNN, TrOCR, fast_plate_ocr, LLM OCR, zone correction |
 | [pipeline.py](pipeline.py) | Orchestrates all steps, frame annotation |
+| [api.py](api.py) | FastAPI REST API wrapper for the pipeline |
+
+---
+
+## REST API (api.py)
+
+Wraps the full pipeline in a FastAPI server.
+
+```bash
+pip install fastapi uvicorn python-multipart
+uvicorn api:app --host 0.0.0.0 --port 8000
+```
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Returns loaded engine status |
+| `/read-plate` | POST | Multipart image upload |
+| `/read-plate/base64` | POST | JSON body with base64-encoded image |
+
+All models are loaded once at startup. Configuration via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ALPR_YOLO` | `yolo_plates.pt` | YOLO weights path |
+| `ALPR_CRNN` | `crnn_plates.pt` | CRNN weights path |
+| `ALPR_TROCR` | `microsoft/trocr-base-printed` | TrOCR model |
+| `ALPR_LLM_MODEL` | `qwen2.5vl:3b` | Ollama LLM model |
+| `ALPR_FAST_OCR_MODEL` | `cct-s-v1-global-model` | fast_plate_ocr model |
+| `ALPR_CONF` | `0.5` | YOLO confidence threshold |
+| `ALPR_NO_TROCR` | `0` | Set to `1` to disable TrOCR |
+| `ALPR_NO_CRNN` | `0` | Set to `1` to disable CRNN |
+| `ALPR_NO_LLM` | `0` | Set to `1` to disable LLM |
+| `ALPR_NO_FAST_OCR` | `0` | Set to `1` to disable fast_plate_ocr |
 
 ---
 
@@ -314,4 +384,5 @@ Each plate crop goes through these steps before OCR:
 - PyTorch (for CRNN + TrOCR)
 - `transformers` (for TrOCR — `microsoft/trocr-base-printed`)
 - OpenCV (`cv2`)
+- `fast-plate-ocr[onnx]` — `pip install "fast-plate-ocr[onnx]"` (optional 4th engine)
 - Ollama running locally with `qwen2.5vl:3b` pulled (only needed if using LLM)

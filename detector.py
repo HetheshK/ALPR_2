@@ -3,8 +3,8 @@
 Step 1 — YOLO license-plate detection.
 
 Exports:
-    load_detector(weights_path) -> YOLO model
-    detect_plates(model, image, ...) -> list[dict]
+    load_detector(weights_path) -> YOLO model 
+    detect_plates(model, image, ...) -> list[dict] 
 """
 
 import numpy as np
@@ -16,7 +16,7 @@ def load_detector(weights_path: str = "yolo_plates.pt"):
     Load a YOLOv8 model.
 
     Tries the fine-tuned plate weights first; falls back to the base
-    yolov8n.pt (general-purpose) if the file is not found.
+    yolov8n.pt (general-purpose) if the file is not found. 
     """
     from ultralytics import YOLO
 

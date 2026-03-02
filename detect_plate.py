@@ -27,7 +27,7 @@ import argparse
 import cv2
 
 from detector import load_detector
-from ocr import load_ocr, load_llm_ocr, load_trocr, load_crnn, run_trocr_only, read_plate_trocr_llm
+from ocr import load_ocr, load_llm_ocr, load_trocr, load_crnn, load_fast_ocr, run_trocr_only, read_plate_trocr_llm
 from pipeline import process_image, process_webcam
 
 
@@ -69,6 +69,10 @@ def main():
                         help="Disable CRNN cross-validation")
     parser.add_argument("--crnn-model", default="crnn_plates.pt", dest="crnn_model",
                         help="Path to trained CRNN weights (default: crnn_plates.pt)")
+    parser.add_argument("--no-fast-ocr", action="store_true", dest="no_fast_ocr",
+                        help="Disable fast_plate_ocr engine")
+    parser.add_argument("--fast-ocr-model", default="cct-s-v1-global-model", dest="fast_ocr_model",
+                        help="fast_plate_ocr model name (default: cct-s-v1-global-model)")
 
     args = parser.parse_args()
 
@@ -92,18 +96,21 @@ def main():
         return
 
     # Load models once — shared across all frames
-    model   = load_detector(args.weights)
-    ocr     = load_ocr()
-    llm_cfg = None if args.no_llm   else load_llm_ocr(model=args.llm_model)
-    trocr   = None if args.no_trocr else load_trocr(model_name=args.trocr_model)
-    crnn    = None if args.no_crnn  else load_crnn(model_path=args.crnn_model)
+    model    = load_detector(args.weights)
+    ocr      = load_ocr()
+    llm_cfg  = None if args.no_llm      else load_llm_ocr(model=args.llm_model)
+    trocr    = None if args.no_trocr    else load_trocr(model_name=args.trocr_model)
+    crnn     = None if args.no_crnn     else load_crnn(model_path=args.crnn_model)
+    fast_ocr = None if args.no_fast_ocr else load_fast_ocr(model_name=args.fast_ocr_model)
 
     if args.webcam:
         process_webcam(model, ocr, llm_cfg, args.webcam_id, args.conf, args.every_n,
-                       trocr=trocr, crnn=crnn, llm_threshold=args.llm_threshold)
+                       trocr=trocr, crnn=crnn, fast_ocr=fast_ocr,
+                       llm_threshold=args.llm_threshold)
     elif args.image:
         process_image(model, ocr, llm_cfg, args.image, args.conf, args.save, args.debug,
-                      trocr=trocr, crnn=crnn, llm_threshold=args.llm_threshold)
+                      trocr=trocr, crnn=crnn, fast_ocr=fast_ocr,
+                      llm_threshold=args.llm_threshold)
     else:
         parser.print_help()
         print("\nERROR: Provide --image <path> or --webcam")

@@ -55,6 +55,7 @@ def run_pipeline(model, ocr, image: np.ndarray, conf_threshold: float,
                  llm_cfg: dict | None = None,
                  trocr=None,
                  crnn=None,
+                 fast_ocr=None,
                  debug: bool = False,
                  llm_threshold: float = 0.85) -> tuple:
     """
@@ -99,7 +100,7 @@ def run_pipeline(model, ocr, image: np.ndarray, conf_threshold: float,
         # Step 4 — OCR (passes A/B via PaddleOCR, pass C via Qwen2-VL if needed)
         t3 = time.time()
         text, ocr_conf = read_plate(ocr, crop, preprocessed,
-                                    trocr=trocr, crnn=crnn,
+                                    trocr=trocr, crnn=crnn, fast_ocr=fast_ocr,
                                     llm_cfg=llm_cfg,
                                     llm_threshold=llm_threshold)
         print(f"[Step 4] OCR → '{text}'  conf={ocr_conf:.3f}  ({(time.time()-t3)*1000:.0f}ms)")
@@ -112,7 +113,7 @@ def run_pipeline(model, ocr, image: np.ndarray, conf_threshold: float,
 
 def process_image(model, ocr, llm_cfg, image_path: str,
                   conf: float, save: bool, debug: bool = False,
-                  trocr=None, crnn=None, llm_threshold: float = 0.85) -> None:
+                  trocr=None, crnn=None, fast_ocr=None, llm_threshold: float = 0.85) -> None:
     """Run the pipeline on a single image file."""
     image = cv2.imread(image_path)
     if image is None:
@@ -120,8 +121,8 @@ def process_image(model, ocr, llm_cfg, image_path: str,
         sys.exit(1)
 
     annotated, _, _ = run_pipeline(model, ocr, image, conf, llm_cfg=llm_cfg,
-                                   trocr=trocr, crnn=crnn, debug=debug,
-                                   llm_threshold=llm_threshold)
+                                   trocr=trocr, crnn=crnn, fast_ocr=fast_ocr,
+                                   debug=debug, llm_threshold=llm_threshold)
 
     if save:
         out_path = f"{Path(image_path).stem}_detected.jpg"
@@ -139,7 +140,7 @@ def process_image(model, ocr, llm_cfg, image_path: str,
 
 def process_webcam(model, ocr, llm_cfg, webcam_id: int,
                    conf: float, every_n: int,
-                   trocr=None, crnn=None, llm_threshold: float = 0.85) -> None:
+                   trocr=None, crnn=None, fast_ocr=None, llm_threshold: float = 0.85) -> None:
     """Run the pipeline on a live webcam feed."""
     cap = cv2.VideoCapture(webcam_id)
     if not cap.isOpened():
@@ -158,7 +159,7 @@ def process_webcam(model, ocr, llm_cfg, webcam_id: int,
         # Run the full pipeline every N frames to keep the feed smooth
         if frame_count % every_n == 0:
             annotated, _, _ = run_pipeline(model, ocr, frame, conf, llm_cfg=llm_cfg,
-                                           trocr=trocr, crnn=crnn,
+                                           trocr=trocr, crnn=crnn, fast_ocr=fast_ocr,
                                            llm_threshold=llm_threshold)
         else:
             annotated = frame

@@ -71,15 +71,17 @@ def load_results(csv_path: str) -> list[dict]:
     return rows
 
 
-def print_top_pairs(confusion: dict, top_n: int):
+def print_top_pairs(confusion: dict, conf_sums: dict, conf_counts: dict, top_n: int):
     pairs = sorted(
         [(cnt, a, p) for (a, p), cnt in confusion.items() if a != p],
         reverse=True,
     )
-    print(f"\n{'Rank':>4}  {'Actual':>6}  {'Predicted':>9}  {'Count':>5}")
-    print("  " + "─" * 32)
+    print(f"\n{'Rank':>4}  {'Actual':>6}  {'Predicted':>9}  {'Count':>5}  {'Avg Conf':>9}")
+    print("  " + "─" * 44)
     for rank, (cnt, actual, pred) in enumerate(pairs[:top_n], 1):
-        print(f"  {rank:>3}.  {actual:>6}  →  {pred:>6}    {cnt:>4}")
+        key = (actual, pred)
+        avg_conf = conf_sums[key] / conf_counts[key] if conf_counts[key] else 0.0
+        print(f"  {rank:>3}.  {actual:>6}  →  {pred:>6}    {cnt:>4}    {avg_conf:>8.1%}")
 
 
 def print_matrix(confusion: dict):
@@ -122,23 +124,35 @@ def main():
     rows = load_results(args.input)
     print(f"Loaded {len(rows)} result rows from '{args.input}'")
 
-    confusion: dict[tuple[str, str], int] = defaultdict(int)
+    confusion:   dict[tuple[str, str], int]   = defaultdict(int)
+    conf_sums:   dict[tuple[str, str], float] = defaultdict(float)
+    conf_counts: dict[tuple[str, str], int]   = defaultdict(int)
     wrong_images = 0
     total_subs   = 0
 
     for row in rows:
-        gt_raw   = row.get("ground_truth", "")
-        pred_raw = row.get("predicted", "")
-        gt_norm  = normalize(gt_raw)
+        gt_raw    = row.get("ground_truth", "")
+        pred_raw  = row.get("predicted", "")
+        gt_norm   = normalize(gt_raw)
         pred_norm = normalize(pred_raw)
 
         if gt_norm == pred_norm:
             continue  # exact match — skip
 
         wrong_images += 1
+
+        # Parse plate-level confidence for this row
+        try:
+            conf = float(row.get("confidence", 0) or 0)
+        except ValueError:
+            conf = 0.0
+
         subs = align_substitutions(pred_norm, gt_norm)
         for actual, predicted in subs:
-            confusion[(actual, predicted)] += 1
+            key = (actual, predicted)
+            confusion[key]   += 1
+            conf_sums[key]   += conf
+            conf_counts[key] += 1
             total_subs += 1
 
     print(f"Wrong predictions : {wrong_images}/{len(rows)}")
@@ -148,7 +162,7 @@ def main():
         print("No substitution errors found — perfect score or empty results.")
         return
 
-    print_top_pairs(confusion, args.top)
+    print_top_pairs(confusion, conf_sums, conf_counts, args.top)
 
     if args.matrix:
         print_matrix(confusion)

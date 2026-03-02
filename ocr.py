@@ -355,6 +355,48 @@ def read_plate_trocr_llm(trocr, raw_crop: np.ndarray,
     return trocr_text, trocr_conf
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 4e — fast_plate_ocr (ONNX, ~0.6 ms/image)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_fast_ocr(model_name: str = "cct-s-v1-global-model"):
+    """
+    Load a fast_plate_ocr LicensePlateRecognizer (ONNX).
+
+    Returns the recognizer on success, or None if unavailable.
+    Install with: pip install fast-plate-ocr
+    """
+    try:
+        from fast_plate_ocr import LicensePlateRecognizer
+        model = LicensePlateRecognizer(model_name)
+        print(f"[Step 4e] fast_plate_ocr loaded: {model_name}")
+        return model
+    except ImportError as e:
+        print(f"[Step 4e] fast_plate_ocr import failed ({e}) — run: pip install fast-plate-ocr")
+    except Exception as e:
+        print(f"[Step 4e] fast_plate_ocr load failed ({e}) — disabled")
+    return None
+
+
+def _fast_ocr_single(fast_ocr, image: np.ndarray) -> tuple[str, float]:
+    """Run fast_plate_ocr on a BGR crop. Returns (text, confidence)."""
+    texts, confs = fast_ocr.run(image, return_confidence=True)
+    if not texts:
+        return "", 0.0
+    conf = confs[0]
+    conf_val = float(np.mean(conf) if hasattr(conf, "__len__") else conf)
+    return str(texts[0]), conf_val
+
+
+def run_fast_ocr_only(fast_ocr, image: np.ndarray) -> tuple[str, float]:
+    """
+    Run fast_plate_ocr on an image and return (sanitised plate text, confidence).
+    Intended for standalone benchmarking — no YOLO or PaddleOCR involved.
+    """
+    raw, conf = _fast_ocr_single(fast_ocr, image)
+    return correct_plate_text(raw), conf
+
+
 def correct_plate_text(text: str) -> str:
     """
     Sanitise OCR output to valid plate characters.
@@ -370,6 +412,7 @@ def read_plate(ocr, raw_crop: np.ndarray, preprocessed_crop: np.ndarray,
                fallback_threshold: float = 0.5,
                trocr=None,
                crnn=None,
+               fast_ocr=None,
                llm_cfg: dict | None = None,
                llm_threshold: float = 0.85) -> tuple[str, float]:
     """
@@ -379,8 +422,10 @@ def read_plate(ocr, raw_crop: np.ndarray, preprocessed_crop: np.ndarray,
     Pass B  — PaddleOCR on plain resize. Runs when pass A conf < fallback_threshold.
     Pass C  — CRNN (custom) on raw crop. Runs when crnn is not None.
     Pass C2 — TrOCR on raw crop. Runs when trocr is not None.
-              Cross-check logic (engines A/C/C2):
-              • 2-of-3 agree (or any two agree when one is absent) → return agreed result.
+    Pass C3 — fast_plate_ocr (ONNX) on raw crop. Runs when fast_ocr is not None.
+              Cross-check logic (engines A/C/C2/C3):
+              • Paddle + any secondary agree → return paddle (boosted conf).
+              • Any two secondaries agree → return that result (boosted conf).
               • All disagree → LLM tiebreak if available, else highest-confidence wins.
     Pass D  — LLM tiebreak (Qwen2-VL). Only on mismatch.
     Fallback— If no secondary engine, LLM runs when PaddleOCR conf < llm_threshold.
@@ -438,12 +483,26 @@ def read_plate(ocr, raw_crop: np.ndarray, preprocessed_crop: np.ndarray,
             print(f"[Step 4c] TrOCR failed: {e}")
             trocr_text, trocr_conf = "", 0.0
 
-    # ── Cross-check: look for 2-of-3 agreement ───────────────────────────────
+    # ── Pass C3  (fast_plate_ocr) ─────────────────────────────────────────────
+    fast_text, fast_conf = "", 0.0
+    if fast_ocr is not None:
+        try:
+            t_fast = time.time()
+            fast_raw, fast_conf = _fast_ocr_single(fast_ocr, raw_crop)
+            fast_text = correct_plate_text(fast_raw)
+            print(f"[Step 4e] fast_plate_ocr → '{fast_text}'  conf={fast_conf:.3f}  ({(time.time()-t_fast)*1000:.0f}ms)")
+        except Exception as e:
+            print(f"[Step 4e] fast_plate_ocr failed: {e}")
+            fast_text, fast_conf = "", 0.0
+
+    # ── Cross-check: look for agreement across all engines ───────────────────
     crnn_alnum  = "".join(c for c in crnn_text  if c.isalnum())
     trocr_alnum = "".join(c for c in trocr_text if c.isalnum())
+    fast_alnum  = "".join(c for c in fast_text  if c.isalnum())
 
     secondary_engines = [(crnn_text,  crnn_alnum,  crnn_conf),
-                         (trocr_text, trocr_alnum, trocr_conf)]
+                         (trocr_text, trocr_alnum, trocr_conf),
+                         (fast_text,  fast_alnum,  fast_conf)]
     secondary_engines = [(t, a, c) for t, a, c in secondary_engines if a]
 
     if secondary_engines:
@@ -453,15 +512,14 @@ def read_plate(ocr, raw_crop: np.ndarray, preprocessed_crop: np.ndarray,
                 print(f"[Step 4] Agreement: paddle+engine → '{paddle_text}'")
                 return paddle_text, min(best_conf + 0.05, 1.0)
 
-        # Check if the two secondary engines agree with each other
-        if (len(secondary_engines) == 2
-                and crnn_alnum and trocr_alnum
-                and crnn_alnum == trocr_alnum):
-            # CRNN + TrOCR agree (Paddle disagrees) — trust secondary
-            winner_text = crnn_text if crnn_conf >= trocr_conf else trocr_text
-            winner_conf = max(crnn_conf, trocr_conf)
-            print(f"[Step 4] CRNN+TrOCR agree → '{winner_text}'")
-            return winner_text, min(winner_conf + 0.05, 1.0)
+        # Check if any two secondary engines agree with each other
+        for i, (t1, a1, c1) in enumerate(secondary_engines):
+            for t2, a2, c2 in secondary_engines[i + 1:]:
+                if a1 == a2:
+                    winner_text = t1 if c1 >= c2 else t2
+                    winner_conf = max(c1, c2)
+                    print(f"[Step 4] Secondary agreement → '{winner_text}'")
+                    return winner_text, min(winner_conf + 0.05, 1.0)
 
         # Full mismatch — try LLM tiebreak
         candidates = [t for t, a, c in [(paddle_text, paddle_alnum, best_conf)]
