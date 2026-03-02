@@ -5,21 +5,22 @@ A multi-engine OCR pipeline for reading US license plates from images or a live 
 ## Pipeline Overview
 
 ```
-Image → YOLO detection → Crop + Preprocess → PaddleOCR      ─┐
-                                           → CRNN+CTC        ─┼─ any-2-of-4 agreement wins
-                                           → TrOCR           ─┤
-                                           → fast_plate_ocr  ─┘
-                                           → Qwen2-VL LLM (tiebreak when all disagree)
-                                           → Zone-corrected text output
+Image → YOLO detection → Crop → fast_plate_ocr ──── conf ≥ 0.85 → done (99.7% of cases)
+                              ↓ low confidence
+                         Preprocess → PaddleOCR  ─┐
+                                    → CRNN+CTC    ─┼─ any-2-of-3 agreement wins
+                                    → TrOCR       ─┘
+                                    → Qwen2-VL LLM (tiebreak when all disagree)
+                                    → Zone-corrected text output
 ```
 
 1. **YOLO** (YOLOv11) detects the plate bounding box
-2. **Preprocessor** crops, denoises (median blur), enhances contrast (CLAHE), sharpens, inverts dark plates, and pads
-3. **PaddleOCR** reads the preprocessed crop (two passes: preprocessed + plain resize)
-4. **CRNN+CTC** reads the same crop as a fast cross-check engine (custom-trained on Lakh dataset)
-5. **TrOCR** provides a third opinion via ViT encoder (optional, slower)
-6. **fast_plate_ocr** provides a fourth ONNX-based opinion (~0.6 ms/image, optional)
-7. **Any-2-of-4 agreement** — if any two engines agree, that result wins
+2. **fast_plate_ocr** (ONNX, ~0.6 ms) runs first on the raw crop — if confidence ≥ 0.85, returns immediately
+3. **Preprocessor** crops, denoises (median blur), enhances contrast (CLAHE), sharpens, inverts dark plates, and pads — only runs on low-confidence cases
+4. **PaddleOCR** reads the preprocessed crop (two passes: preprocessed + plain resize)
+5. **CRNN+CTC** reads the same crop as a fast cross-check engine (custom-trained on Lakh dataset)
+6. **TrOCR** provides a third opinion via ViT encoder (optional, slower)
+7. **Any-2-of-3 agreement** — if any two fallback engines agree, that result wins
 8. If all engines disagree → **Qwen2-VL LLM** (via Ollama) makes the final call
 9. **Zone correction** fixes common OCR confusions (e.g. `0`↔`O`, `1`↔`I`, `8`↔`B`)
 

@@ -413,26 +413,45 @@ def read_plate(ocr, raw_crop: np.ndarray, preprocessed_crop: np.ndarray,
                trocr=None,
                crnn=None,
                fast_ocr=None,
+               fast_ocr_threshold: float = 0.85,
                llm_cfg: dict | None = None,
                llm_threshold: float = 0.85) -> tuple[str, float]:
     """
-    Multi-pass OCR with cross-engine validation and LLM tiebreaking.
+    Multi-pass OCR with fast_plate_ocr as the primary engine.
 
-    Pass A  — PaddleOCR on fully preprocessed crop (CLAHE + sharpen).
+    Pass E  — fast_plate_ocr (ONNX) runs first on raw crop (~0.6 ms).
+              If conf ≥ fast_ocr_threshold → return immediately (skip all heavy engines).
+    Pass A  — PaddleOCR on preprocessed crop. Runs only when fast_plate_ocr is absent
+              or returned low confidence.
     Pass B  — PaddleOCR on plain resize. Runs when pass A conf < fallback_threshold.
-    Pass C  — CRNN (custom) on raw crop. Runs when crnn is not None.
-    Pass C2 — TrOCR on raw crop. Runs when trocr is not None.
-    Pass C3 — fast_plate_ocr (ONNX) on raw crop. Runs when fast_ocr is not None.
-              Cross-check logic (engines A/C/C2/C3):
+    Pass C  — CRNN (custom) on raw crop.
+    Pass C2 — TrOCR on raw crop.
+    Cross-check (A/C/C2/E):
               • Paddle + any secondary agree → return paddle (boosted conf).
               • Any two secondaries agree → return that result (boosted conf).
               • All disagree → LLM tiebreak if available, else highest-confidence wins.
-    Pass D  — LLM tiebreak (Qwen2-VL). Only on mismatch.
-    Fallback— If no secondary engine, LLM runs when PaddleOCR conf < llm_threshold.
+    Pass D  — LLM tiebreak (Qwen2-VL). Only on full mismatch.
 
     Returns:
         (plate_text, confidence)  — confidence is 0.0 if nothing was read
     """
+    # ── Pass E: fast_plate_ocr — primary engine, runs first ──────────────────
+    fast_text, fast_conf = "", 0.0
+    if fast_ocr is not None:
+        try:
+            t_fast = time.time()
+            fast_raw, fast_conf = _fast_ocr_single(fast_ocr, raw_crop)
+            fast_text = correct_plate_text(fast_raw)
+            print(f"[Step 4e] fast_plate_ocr → '{fast_text}'  conf={fast_conf:.3f}  ({(time.time()-t_fast)*1000:.0f}ms)")
+            if fast_text and fast_conf >= fast_ocr_threshold:
+                print(f"[Step 4e] fast_plate_ocr high-confidence — skipping heavy engines")
+                return fast_text, fast_conf
+        except Exception as e:
+            print(f"[Step 4e] fast_plate_ocr failed: {e}")
+            fast_text, fast_conf = "", 0.0
+
+    # ── fast_plate_ocr low-confidence or unavailable — run full pipeline ──────
+
     # ── Passes A / B  (PaddleOCR) ────────────────────────────────────────────
     text_a, conf_a = _ocr_single(ocr, preprocessed_crop)
     print(f"[Step 4a] PaddleOCR pass A → '{text_a}'  conf={conf_a:.3f}")
@@ -456,7 +475,6 @@ def read_plate(ocr, raw_crop: np.ndarray, preprocessed_crop: np.ndarray,
 
     paddle_text = correct_plate_text(best_text)
     print(f"[Step 4a] PaddleOCR best   → '{paddle_text}'  conf={best_conf:.3f}")
-
     paddle_alnum = "".join(c for c in paddle_text if c.isalnum())
 
     # ── Pass C  (CRNN) ────────────────────────────────────────────────────────
@@ -469,7 +487,6 @@ def read_plate(ocr, raw_crop: np.ndarray, preprocessed_crop: np.ndarray,
             print(f"[Step 4d] CRNN          → '{crnn_text}'  conf={crnn_conf:.3f}  ({(time.time()-t_crnn)*1000:.0f}ms)")
         except Exception as e:
             print(f"[Step 4d] CRNN failed: {e}")
-            crnn_text, crnn_conf = "", 0.0
 
     # ── Pass C2  (TrOCR) ─────────────────────────────────────────────────────
     trocr_text, trocr_conf = "", 0.0
@@ -481,19 +498,6 @@ def read_plate(ocr, raw_crop: np.ndarray, preprocessed_crop: np.ndarray,
             print(f"[Step 4c] TrOCR         → '{trocr_text}'  conf={trocr_conf:.3f}  ({(time.time()-t_trocr)*1000:.0f}ms)")
         except Exception as e:
             print(f"[Step 4c] TrOCR failed: {e}")
-            trocr_text, trocr_conf = "", 0.0
-
-    # ── Pass C3  (fast_plate_ocr) ─────────────────────────────────────────────
-    fast_text, fast_conf = "", 0.0
-    if fast_ocr is not None:
-        try:
-            t_fast = time.time()
-            fast_raw, fast_conf = _fast_ocr_single(fast_ocr, raw_crop)
-            fast_text = correct_plate_text(fast_raw)
-            print(f"[Step 4e] fast_plate_ocr → '{fast_text}'  conf={fast_conf:.3f}  ({(time.time()-t_fast)*1000:.0f}ms)")
-        except Exception as e:
-            print(f"[Step 4e] fast_plate_ocr failed: {e}")
-            fast_text, fast_conf = "", 0.0
 
     # ── Cross-check: look for agreement across all engines ───────────────────
     crnn_alnum  = "".join(c for c in crnn_text  if c.isalnum())
@@ -529,11 +533,11 @@ def read_plate(ocr, raw_crop: np.ndarray, preprocessed_crop: np.ndarray,
                 t_llm = time.time()
                 text_d, conf_d = _llm_tiebreak(llm_cfg, raw_crop,
                                                candidates[0], candidates[1])
-                print(f"[Step 4e] LLM tiebreak  → '{text_d}'  ({(time.time()-t_llm)*1000:.0f}ms)")
+                print(f"[Step 4f] LLM tiebreak  → '{text_d}'  ({(time.time()-t_llm)*1000:.0f}ms)")
                 if text_d:
                     return correct_plate_text(text_d), conf_d
             except Exception as e:
-                print(f"[Step 4e] LLM tiebreak failed: {e}")
+                print(f"[Step 4f] LLM tiebreak failed: {e}")
 
         # No LLM — highest-confidence engine wins
         all_candidates = (
